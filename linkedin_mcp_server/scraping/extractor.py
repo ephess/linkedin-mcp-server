@@ -491,14 +491,22 @@ def normalize_post_url(post: str) -> str | None:
     return f"https://www.linkedin.com{path}"
 
 
-# Comment pagination on a post permalink page is a plain <button> with no
-# structural signal — no href, no distinguishing ARIA attribute — so per the
-# Scraping Rules the visible label is matched via an explicit per-locale
-# table. BrowserManager forces the context locale to en-US (core/browser.py),
-# so the "en" entry is the operative one; a locale without an entry skips
-# pagination and returns only the initially rendered comments. The pattern
-# covers both thread-level pagination ("Load more comments") and collapsed
-# reply expansion ("See previous replies" / "Show more replies").
+# Comment pagination on a post permalink page carries no structural signal —
+# no href, no distinguishing ARIA attribute — so per the Scraping Rules the
+# visible label is matched via an explicit per-locale table. BrowserManager
+# forces the context locale to en-US (core/browser.py), so the "en" entry is
+# the operative one; a locale without an entry skips pagination and returns
+# only the initially rendered comments. The pattern covers both thread-level
+# pagination ("Load more comments") and collapsed reply expansion
+# ("See previous replies" / "Show more replies").
+#
+# The two mechanisms use different elements. Thread-level pagination is a real
+# <button>; the collapsed-reply expander is a <div role="button"> wrapping a
+# <p> (verified live 2026-08-11 on a post with 26 comments, where a
+# "main button" selector matched zero nodes while three expanders were on the
+# page). Matching only <button> silently returned the first ~20 comments and
+# dropped every collapsed reply.
+_POST_MORE_COMMENTS_SELECTOR = 'main button, main [role="button"]'
 _POST_MORE_COMMENTS_RE: dict[str, re.Pattern[str]] = {
     "en": re.compile(
         r"^(?:Load|Show|See)\s+(?:more|previous)\s+(?:comments|replies)\b",
@@ -1519,16 +1527,25 @@ class LinkedInExtractor:
         ``_POST_MORE_COMMENTS_RE`` table (see its docstring for why text
         matching is unavoidable here). Returns True iff a click landed.
         """
-        button = self._page.locator("main button").filter(has_text=pattern)
+        button = self._page.locator(_POST_MORE_COMMENTS_SELECTOR).filter(
+            has_text=pattern
+        )
         try:
-            if await button.count() == 0:
+            count = await button.count()
+            if count == 0:
                 return False
-            target = button.first
-            if not await target.is_visible():
-                return False
-            await target.scroll_into_view_if_needed(timeout=2000)
-            await target.click(timeout=2000)
-            return True
+            # The first match is not necessarily clickable: LinkedIn keeps
+            # already-expanded rows in the DOM as hidden nodes. Walk the
+            # matches and take the first visible one instead of giving up on
+            # the first hit, which would strand every later expander.
+            for i in range(count):
+                target = button.nth(i)
+                if not await target.is_visible():
+                    continue
+                await target.scroll_into_view_if_needed(timeout=2000)
+                await target.click(timeout=2000)
+                return True
+            return False
         except PlaywrightTimeoutError:
             logger.debug("Comment pagination click timed out")
             return False
