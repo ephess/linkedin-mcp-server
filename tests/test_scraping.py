@@ -16,6 +16,7 @@ from linkedin_mcp_server.scraping.connection import (
 from linkedin_mcp_server.scraping.extractor import (
     ExtractedSection,
     LinkedInExtractor,
+    _POST_MORE_COMMENTS_RE,
     _RATE_LIMITED_MSG,
     _build_feed_references,
     _truncate_linkedin_noise,
@@ -5439,6 +5440,57 @@ class TestGetPostComments:
         ):
             await extractor._expand_post_comments(4)
         assert mock_page.mouse.wheel.await_count == 4
+
+    @staticmethod
+    def _wire_matches(mock_page, visibilities):
+        """Equip the mock page with N pagination matches of given visibility."""
+        targets = []
+        for visible in visibilities:
+            t = MagicMock()
+            t.is_visible = AsyncMock(return_value=visible)
+            t.scroll_into_view_if_needed = AsyncMock()
+            t.click = AsyncMock()
+            targets.append(t)
+        matches = MagicMock()
+        matches.count = AsyncMock(return_value=len(targets))
+        matches.nth = MagicMock(side_effect=lambda i: targets[i])
+        locator = MagicMock()
+        locator.filter = MagicMock(return_value=matches)
+        mock_page.locator = MagicMock(return_value=locator)
+        return targets
+
+    async def test_selector_matches_role_button_expanders(self, mock_page):
+        # The collapsed-reply expander is a <div role="button">, not a
+        # <button>. A "main button" selector matches zero nodes and silently
+        # drops every collapsed reply, which is what this covers.
+        self._wire_matches(mock_page, [True])
+        extractor = LinkedInExtractor(mock_page)
+        assert await extractor._click_more_comments_button(
+            _POST_MORE_COMMENTS_RE["en"]
+        )
+        selector = mock_page.locator.call_args.args[0]
+        assert '[role="button"]' in selector
+        assert "button" in selector
+
+    async def test_click_skips_hidden_matches(self, mock_page):
+        # Already-expanded rows stay in the DOM as hidden nodes. Stopping at
+        # the first match would strand every later expander.
+        targets = self._wire_matches(mock_page, [False, False, True])
+        extractor = LinkedInExtractor(mock_page)
+        assert await extractor._click_more_comments_button(
+            _POST_MORE_COMMENTS_RE["en"]
+        )
+        assert targets[0].click.await_count == 0
+        assert targets[1].click.await_count == 0
+        assert targets[2].click.await_count == 1
+
+    async def test_click_reports_failure_when_all_matches_hidden(self, mock_page):
+        targets = self._wire_matches(mock_page, [False, False])
+        extractor = LinkedInExtractor(mock_page)
+        assert not await extractor._click_more_comments_button(
+            _POST_MORE_COMMENTS_RE["en"]
+        )
+        assert all(t.click.await_count == 0 for t in targets)
 
 
 class TestGetMyAnalytics:
